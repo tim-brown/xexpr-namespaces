@@ -1,5 +1,5 @@
 #lang racket
-(require racket/match racket/contract)
+(require racket/match racket/contract xml/xml)
 
 (provide xml-normalise-namespace
          (struct-out ns:tag))
@@ -14,68 +14,89 @@
       [(_ ns-id tag-id)
        #'(or
           (app
-          symbol->string 
-          (pregexp
-           "(.*):(.*)"
-           (list
-            _
-            (app string->symbol ns-id)
-            (app string->symbol tag-id))))
-          (? symbol? (and tag-id (app (const 'default) ns-id))))])))
+           symbol->string 
+           (pregexp
+            "(.*):(.*)"
+            (list _ (app string->symbol ns-id) (app string->symbol tag-id))))
+          #;(? symbol? (and tag-id (app (const 'default) ns-id)))
+          )])))
 
 (define ((xml-normalise-namespace
-          combine-ns-tag initial-namespaces
+          combine-ns-tag
+          initial-abbrevs-dict
           #:elimiate-whitespace? (eliminate-whitespace? #t)
-          #:add-empty-attributes? (add-empty-attributes? #t))
+          #:add-empty-attributes? (add-empty-attributes? #t)
+          #:replace-element
+          (replace-element
+           (λ (abbrevs-dict ns-abbr tag)
+             (if (not (dict-has-key? abbrevs-dict ns-abbr))
+                 tag
+                 (combine-ns-tag (dict-ref abbrevs-dict ns-abbr) tag))))
+          #:replace-attribute
+          (replace-attribute
+           (λ (abbrevs-dict ns-abbr tag)
+             (combine-ns-tag (dict-ref abbrevs-dict ns-abbr) tag)
+             (if (eq? ns-abbr 'default)
+                 tag
+                 (replace-element abbrevs-dict ns-abbr tag)))))
          X)
-  (define (recur current-namespaces sub-X)
-    (define (ns.elem ns-abbr tag)
-      (combine-ns-tag (dict-ref current-namespaces ns-abbr) tag))
-    (define ((ns.attr ns-abbr) tag) ; unlike ns.elem, this is pre-curried
-      (if (eq? ns-abbr 'default) tag (combine-ns-tag (dict-ref current-namespaces ns-abbr) tag)))
+  
+  (define (recur current-abbrevs-dict sub-X)
     (match sub-X
+      ;; get the atomic forms out of the way...
+      [(? symbol? s) s]
+      [(? string? s) s]
+      [(? valid-char? v) v]
+      [(? comment? c) c]
+      [(? p-i? p-i) p-i]
+      [(? cdata? c-d) c-d]      
+      
+      ;; Attributes that change the namespace context
+      
       ;; concatenate new namespace abbreviation to current-namespaces
-      [(list (? symbol? tag) (list-no-order (list (x:y _ ns-abbr) ns) attrs ...) content ...)
-       (recur (dict-set current-namespaces ns-abbr ns) (list* tag attrs content))]
+      [(list (? symbol? tag)
+             (list-no-order (list (x:y _ ns-abbr) ns) attrs ...) content ...)
+       (recur (dict-set current-abbrevs-dict ns-abbr ns) (list* tag attrs content))]
       
       ;; concatenate new DEFAULT namespace abbreviation to current-namespaces
       [(list (? symbol? tag)
              (list-no-order (list (app symbol->string (regexp #rx"^xmlns$")) ns)  attrs ...)
              content ...)
-       (recur (dict-set current-namespaces 'default ns) (list* tag attrs content))]
+       (recur (dict-set current-abbrevs-dict 'default ns) (list* tag attrs content))]
+      
+      ;; xexprs that need rewriting
       
       ;; xexpr tag with namespace abbreviation w/ attributes
       [(list (x:y ns tag)
              (and attrs (list (list (? symbol?) (? string?)) ...))
              content ...)
-       (list* (ns.elem ns tag)
+       (list* (replace-element current-abbrevs-dict ns tag)
               attrs
-              (filter-map (curry recur current-namespaces) content))]
+              (filter-map (curry recur current-abbrevs-dict) content))]
       
       ;; xexpr tag w/o namespace abbreviation w/ attributes
       [(list (? symbol? tag)
              (and attrs (list (list (? symbol?) (? string?)) ...))
              content ...)
-       (list* (ns.elem 'default tag)
+       (list* (replace-element current-abbrevs-dict 'default tag)
               attrs
-              (filter-map (xml-normalise-namespace current-namespaces) content))]
+              (filter-map (curry recur current-abbrevs-dict) content))]
       
       ;; xexpr tag w/ namespace abbreviation without attributes
       [(cons (x:y ns tag) content)
-       (cons (ns.elem ns tag)
+       (cons (replace-element current-abbrevs-dict ns tag)
              (append
               (if add-empty-attributes? '(()) '())
-              (filter-map (curry recur current-namespaces) content)))]
+              (filter-map (curry recur current-abbrevs-dict) content)))]
       
       ;; xexpr tag w/o namespace abbreviation w/o attributes
-      #;[(list (? symbol? tag) content ...)
-       (cons (ns.elem 'default tag)
+      [(list (? symbol? tag) content ...)
+       (cons (replace-element current-abbrevs-dict 'default tag)
              (append
               (if add-empty-attributes? '(()) '())
-              (filter-map (xml-normalise-namespace current-namespaces) content)))]
+              (filter-map (curry recur current-abbrevs-dict) content)))]
       
-      [(pregexp #px"^[[:space:]]*$") (=> skip-match) (and (not eliminate-whitespace?) (skip-match))]
-      
+      ; [(pregexp #px"^[[:space:]]*$") (=> skip-match) (and (not eliminate-whitespace?) (skip-match))]      
       (else (eprintf "~s~%" else) else)))
   
-  (recur initial-namespaces X))
+  (recur initial-abbrevs-dict X))
